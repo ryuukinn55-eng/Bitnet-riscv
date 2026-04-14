@@ -43,6 +43,10 @@ GGML_API void ggml_preprocessor(int m, int k, void* B, void* LUT_Scales, void* Q
 GGML_API void ggml_qgemm_lut(int bs, int m, int k, int BK, void* A, void* sign, void* LUT, void* Scales, void* LUT_Scales, void* C);
 GGML_API void ggml_preprocessor(int bs, int m, int three_k, int two_k, void* B, void* LUT_Scales, void* Three_QLUT, void* Two_QLUT);
 #endif
+#if defined(GGML_BITNET_RISCV_TL3)
+GGML_API void ggml_qgemm_lut(int m, int k, void* A, void* LUT, void* Scales, void* LUT_Scales, void* C);
+GGML_API void ggml_preprocessor(int m, int k, void* B, void* LUT_Scales, void* QLUT);
+#endif
 
 #ifdef  __cplusplus
 }

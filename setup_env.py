@@ -60,12 +60,14 @@ SUPPORTED_HF_MODELS = {
 
 SUPPORTED_QUANT_TYPES = {
     "arm64": ["i2_s", "tl1"],
-    "x86_64": ["i2_s", "tl2"]
+    "x86_64": ["i2_s", "tl2"],
+    "riscv64": ["i2_s", "tl3"],
 }
 
 COMPILER_EXTRA_ARGS = {
-    "arm64": ["-DBITNET_ARM_TL1=ON"],
-    "x86_64": ["-DBITNET_X86_TL2=ON"]
+    "arm64": ["-DBITNET_ARM_TL1=OFF"],
+    "x86_64": ["-DBITNET_X86_TL2=OFF"],
+    "riscv64": []
 }
 
 OS_EXTRA_ARGS = {
@@ -79,15 +81,25 @@ ARCH_ALIAS = {
     "aarch64": "arm64",
     "arm64": "arm64",
     "ARM64": "arm64",
+    "riscv64": "riscv64",
+    "riscv": "riscv64",
 }
 
 def system_info():
-    return platform.system(), ARCH_ALIAS[platform.machine()]
+    machine = platform.machine()
+    return platform.system(), ARCH_ALIAS.get(machine, machine)
 
 def get_model_name():
     if args.hf_repo:
         return SUPPORTED_HF_MODELS[args.hf_repo]["model_name"]
     return os.path.basename(os.path.normpath(args.model_dir))
+
+def get_model_quant_type():
+    # RISC-V TL3 reuses the on-disk I2_S model format and switches only the
+    # execution backend at build/runtime.
+    if args.target_arch == "riscv64" and args.quant_type == "tl3":
+        return "i2_s"
+    return args.quant_type
 
 def run_command(command, shell=False, log_step=None):
     """Run a system command and ensure it succeeds."""
@@ -107,10 +119,9 @@ def run_command(command, shell=False, log_step=None):
         sys.exit(1)
 
 def prepare_model():
-    _, arch = system_info()
     hf_url = args.hf_repo
     model_dir = args.model_dir
-    quant_type = args.quant_type
+    quant_type = get_model_quant_type()
     quant_embd = args.quant_embd
     if hf_url is not None:
         # download the model
@@ -154,7 +165,7 @@ def setup_gguf():
     run_command([sys.executable, "-m", "pip", "install", "3rdparty/llama.cpp/gguf-py"], log_step="install_gguf")
 
 def gen_code():
-    _, arch = system_info()
+    arch = args.target_arch
     
     llama3_f3_models = set([model['model_name'] for model in SUPPORTED_HF_MODELS.values() if model['model_name'].startswith("Falcon") or model['model_name'].startswith("Llama")])
 
@@ -180,7 +191,7 @@ def gen_code():
             run_command([sys.executable, "utils/codegen_tl1.py", "--model", "bitnet_b1_58-3B", "--BM", "160,320,320", "--BK", "64,128,64", "--bm", "32,64,32"], log_step="codegen")
         else:
             raise NotImplementedError()
-    else:
+    elif arch == "x86_64":
         if args.use_pretuned:
             # cp preset_kernels/model_name/bitnet-lut-kernels_tl1.h to include/bitnet-lut-kernels.h
             pretuned_kernels = os.path.join("preset_kernels", get_model_name())
@@ -198,21 +209,72 @@ def gen_code():
             run_command([sys.executable, "utils/codegen_tl2.py", "--model", "bitnet_b1_58-3B", "--BM", "160,320,320", "--BK", "96,96,96", "--bm", "32,32,32"], log_step="codegen")    
         else:
             raise NotImplementedError()
+    elif arch == "riscv64":
+        if args.quant_type == "tl3":
+            logging.info("RISC-V TL3 backend selected, skipping TL1/TL2 kernel code generation.")
+        else:
+            logging.info("RISC-V I2_S backend selected, skipping TL1/TL2 kernel code generation.")
+    else:
+        logging.error(f"Arch {arch} is not supported for kernel generation yet.")
+        sys.exit(1)
 
+
+# def compile():
+#     # Check if cmake is installed
+#     cmake_exists = subprocess.run(["cmake", "--version"], capture_output=True)
+#     if cmake_exists.returncode != 0:
+#         logging.error("Cmake is not available. Please install CMake and try again.")
+#         sys.exit(1)
+#     _, arch = system_info()
+#     if arch not in COMPILER_EXTRA_ARGS.keys():
+#         logging.error(f"Arch {arch} is not supported yet")
+#         exit(0)
+#     logging.info("Compiling the code using CMake.")
+#     run_command(["cmake", "-B", "build", *COMPILER_EXTRA_ARGS[arch], *OS_EXTRA_ARGS.get(platform.system(), []), "-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++"], log_step="generate_build_files")
+#     # run_command(["cmake", "--build", "build", "--target", "llama-cli", "--config", "Release"])
+#     run_command(["cmake", "--build", "build", "--config", "Release"], log_step="compile")
 
 def compile():
-    # Check if cmake is installed
     cmake_exists = subprocess.run(["cmake", "--version"], capture_output=True)
     if cmake_exists.returncode != 0:
         logging.error("Cmake is not available. Please install CMake and try again.")
         sys.exit(1)
-    _, arch = system_info()
-    if arch not in COMPILER_EXTRA_ARGS.keys():
-        logging.error(f"Arch {arch} is not supported yet")
-        exit(0)
+
+    _, host_arch = system_info()
+    target_arch = args.target_arch
+
+    print("host_arch =", host_arch)
+    print("target_arch =", target_arch)
+
+    if target_arch not in COMPILER_EXTRA_ARGS.keys():
+        logging.error(f"Arch {target_arch} is not supported yet")
+        sys.exit(1)
+
     logging.info("Compiling the code using CMake.")
-    run_command(["cmake", "-B", "build", *COMPILER_EXTRA_ARGS[arch], *OS_EXTRA_ARGS.get(platform.system(), []), "-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++"], log_step="generate_build_files")
-    # run_command(["cmake", "--build", "build", "--target", "llama-cli", "--config", "Release"])
+
+    cmd = [
+        "cmake", "-B", "build",
+        *COMPILER_EXTRA_ARGS[target_arch],
+        *OS_EXTRA_ARGS.get(platform.system(), []),
+    ]
+
+    if target_arch == "riscv64":
+        cmd += [
+            f"-DBITNET_RISCV_TL3={'ON' if args.quant_type == 'tl3' else 'OFF'}",
+            f"-DCMAKE_TOOLCHAIN_FILE={args.toolchain_file}",
+            f"-DCMAKE_C_FLAGS=-D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -funroll-loops -g0 -D_FORTIFY_SOURCE=1 -march={args.march} -mrvv-vector-bits=zvl",
+            f"-DCMAKE_CXX_FLAGS=-D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -funroll-loops -g0 -D_FORTIFY_SOURCE=1 -march={args.march} -mrvv-vector-bits=zvl",
+            '-DBUILD_SHARED_LIBS=OFF',
+        ]
+    else:
+        cmd += [
+            "-DCMAKE_C_COMPILER=clang",
+            "-DCMAKE_CXX_COMPILER=clang++",
+        ]
+
+    print("cmake cmd:", " ".join(cmd))
+
+    run_command(cmd, log_step="generate_build_files")
     run_command(["cmake", "--build", "build", "--config", "Release"], log_step="compile")
 
 def main():
@@ -222,15 +284,33 @@ def main():
     prepare_model()
     
 def parse_args():
-    _, arch = system_info()
+    _, host_arch = system_info()
+    default_target_arch = "riscv64"
     parser = argparse.ArgumentParser(description='Setup the environment for running the inference')
     parser.add_argument("--hf-repo", "-hr", type=str, help="Model used for inference", choices=SUPPORTED_HF_MODELS.keys())
     parser.add_argument("--model-dir", "-md", type=str, help="Directory to save/load the model", default="models")
     parser.add_argument("--log-dir", "-ld", type=str, help="Directory to save the logging info", default="logs")
-    parser.add_argument("--quant-type", "-q", type=str, help="Quantization type", choices=SUPPORTED_QUANT_TYPES[arch], default="i2_s")
+    parser.add_argument("--target-arch", type=str, choices=SUPPORTED_QUANT_TYPES.keys(), default=default_target_arch,
+                        help=f"Target architecture to compile for (default: {default_target_arch}, host: {host_arch})")
+    parser.add_argument("--toolchain-file", type=str,
+                        default=os.path.expanduser('~/riscv-gnu-toolchain-cx1c/share/toolchain/toolchainfile.cmake'),
+                        help="CMake toolchain file used for riscv64 builds")
+    parser.add_argument("--march", type=str, default="rv64gcv_zvl256b",
+                        help="Target -march value used for riscv64 builds (default tuned for K1 VLEN=256)")
+    parser.add_argument("--quant-type", "-q", type=str, help="Quantization type",
+                        choices=sorted(set(q for quant_list in SUPPORTED_QUANT_TYPES.values() for q in quant_list)),
+                        default="i2_s")
     parser.add_argument("--quant-embd", action="store_true", help="Quantize the embeddings to f16")
     parser.add_argument("--use-pretuned", "-p", action="store_true", help="Use the pretuned kernel parameters")
-    return parser.parse_args()
+    parsed_args = parser.parse_args()
+
+    if parsed_args.quant_type not in SUPPORTED_QUANT_TYPES[parsed_args.target_arch]:
+        parser.error(
+            f"Quantization type '{parsed_args.quant_type}' is not supported for target arch "
+            f"'{parsed_args.target_arch}'. Supported values: {', '.join(SUPPORTED_QUANT_TYPES[parsed_args.target_arch])}"
+        )
+
+    return parsed_args
 
 def signal_handler(sig, frame):
     logging.info("Ctrl+C pressed, exiting...")

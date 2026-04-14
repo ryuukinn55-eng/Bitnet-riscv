@@ -1,5 +1,7 @@
 #if defined(GGML_BITNET_X86_TL2)
 #include "ggml-bitnet.h"
+#include <cstring>
+#include <immintrin.h>
 #define GGML_BITNET_MAX_NODES 8192
 static bool initialized = false;
 static bitnet_tensor_extra * bitnet_tensor_extras = nullptr;
@@ -98,7 +100,7 @@ inline int32_t partial_max_reset(int32_t bs, void* lut_scales_) {
 template<int act_k>
 inline int32_t three_lut_ctor(int8_t* qlut, bitnet_float_type* b, bitnet_float_type* lut_scales) {
 #if defined __AVX2__
-    __m256 vec_lut[16];
+    __m256i vec_lut[16];
     const __m256i vec_bi = _mm256_set_epi32(84, 72, 60, 48, 36, 24, 12, 0);
     float scales = *lut_scales;
     __m256i shuffle_mask = _mm256_set_epi8(
@@ -184,7 +186,7 @@ inline int32_t three_lut_ctor(int8_t* qlut, bitnet_float_type* b, bitnet_float_t
 template<int act_k>
 inline int32_t two_lut_ctor(int8_t* qlut, bitnet_float_type* b, bitnet_float_type* lut_scales) {
 #if defined __AVX2__
-    __m256 vec_lut[16];
+    __m256i vec_lut[16];
     const __m256i vec_bi = _mm256_set_epi32(56, 48, 40, 32, 24, 16, 8, 0);
     float scales = *lut_scales;
     __m256i shuffle_mask = _mm256_set_epi8(
@@ -1152,7 +1154,9 @@ else if (m == 8640 && k == 3200) {
 
     scales = (bitnet_float_type *) aligned_malloc(sizeof(bitnet_float_type));
     qweights = (uint8_t *) tensor->data;
-    float * i2_scales = (float * )(qweights + k * m / 4);
+    int nbytes = (k - 256) * m / 3 * 5 / 8 + 256 * m / 2 * 4 / 8;
+    if (nbytes % 32 != 0) nbytes = 32 - nbytes % 32 + nbytes;
+    float * i2_scales = (float * )(qweights + nbytes);
     scales[0] = (bitnet_float_type) i2_scales[0];
 
     tensor->extra = bitnet_tensor_extras + bitnet_tensor_extras_index;
@@ -1165,3 +1169,274 @@ else if (m == 8640 && k == 3200) {
     };
 }
 #endif
+
+// ============================================================================
+// RISC-V TL3 lookup-table kernel
+// ----------------------------------------------------------------------------
+// Group-of-4 ternary packing. Each output byte of qweights encodes
+//   idx = (w0+1)*27 + (w1+1)*9 + (w2+1)*3 + (w3+1)   w_i in {-1,0,+1}
+// Runtime LUT holds 81 int16 partial-sums per K-group. GEMV inner loop is
+// a single RVV indexed load (vluxei16) per vl output rows per K-group.
+// ============================================================================
+#if defined(GGML_BITNET_RISCV_TL3)
+#include "ggml-bitnet.h"
+#include <riscv_vector.h>
+#include <cmath>
+#include <cstring>
+#include <cstdlib>
+#include <cstdint>
+
+#ifndef GGML_BITNET_MAX_NODES
+#define GGML_BITNET_MAX_NODES 8192
+#endif
+
+#define TL3_G          4                      // ternary weights per group
+#define TL3_LUT_SIZE   81                     // 3^4
+#define TL3_LUT_BYTES  (TL3_LUT_SIZE * (int)sizeof(int16_t))
+
+// I2_S on-disk block constants (mirror ggml-bitnet-mad.cpp)
+#define TL3_QK_I2_S              128
+#define TL3_QK_I2_S_PACKED_BYTES 32
+
+static bool initialized = false;
+static bitnet_tensor_extra * bitnet_tensor_extras = nullptr;
+static size_t bitnet_tensor_extras_index = 0;
+
+static inline void * aligned_malloc(size_t size) {
+#if defined(_WIN32)
+    return _aligned_malloc(size, 64);
+#else
+    void * ptr = nullptr;
+    if (posix_memalign(&ptr, 64, size) != 0) return nullptr;
+    return ptr;
+#endif
+}
+static inline void aligned_free(void * ptr) {
+#if defined(_WIN32)
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
+
+static bool is_type_supported(enum ggml_type type) {
+    return type == GGML_TYPE_I2_S || type == GGML_TYPE_TL1;
+}
+
+// ---- per-tensor activation |b| max -----------------------------------------
+static inline void per_tensor_quant(int k, void* lut_scales_, void* b_) {
+    bitnet_float_type * lut_scales = (bitnet_float_type *) lut_scales_;
+    const float * b = (const float *) b_;
+    float amax = 0.0f;
+    int i = 0;
+    while (i < k) {
+        size_t vl = __riscv_vsetvl_e32m4(k - i);
+        vfloat32m4_t v   = __riscv_vle32_v_f32m4(b + i, vl);
+        vfloat32m4_t va  = __riscv_vfabs_v_f32m4(v, vl);
+        vfloat32m1_t z   = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+        vfloat32m1_t r   = __riscv_vfredmax_vs_f32m4_f32m1(va, z, vl);
+        float chunk      = __riscv_vfmv_f_s_f32m1_f32(r);
+        if (chunk > amax) amax = chunk;
+        i += (int) vl;
+    }
+    *lut_scales = (amax == 0.0f) ? 0.0f : (127.0f / amax);
+}
+
+static inline void partial_max_reset(void * lut_scales_) {
+    *((bitnet_float_type *) lut_scales_) = 0.0f;
+}
+
+// ---- build K/4 tables of 81 int16 partial sums -----------------------------
+// qlut layout: int16[n_groups][81], g-major
+template<int act_k>
+static inline void lut_ctor(int8_t * qlut, bitnet_float_type * b,
+                            bitnet_float_type * lut_scales) {
+    const float scale = *lut_scales;
+    int16_t * lut = reinterpret_cast<int16_t *>(qlut);
+    const int n_groups = act_k / TL3_G;
+
+    for (int g = 0; g < n_groups; ++g) {
+        int q[TL3_G];
+        for (int j = 0; j < TL3_G; ++j) {
+            float v = b[g * TL3_G + j] * scale;
+            int qi = (int) lrintf(v);
+            if (qi >  127) qi =  127;
+            if (qi < -127) qi = -127;
+            q[j] = qi;
+        }
+        int16_t * slot = lut + g * TL3_LUT_SIZE;
+        for (int idx = 0; idx < TL3_LUT_SIZE; ++idx) {
+            int r = idx;
+            int w0 = r / 27 - 1; r %= 27;
+            int w1 = r / 9  - 1; r %= 9;
+            int w2 = r / 3  - 1; r %= 3;
+            int w3 = r      - 1;
+            slot[idx] = (int16_t)(w0 * q[0] + w1 * q[1] + w2 * q[2] + w3 * q[3]);
+        }
+    }
+}
+
+// ---- core GEMV: rows m in [0,M), packed bytes A laid out as [g*M + m] ------
+static inline int qgemm_lut_tl3(int M, int K,
+                                const uint8_t * A, const int16_t * LUT,
+                                float w_scale, float lut_scale,
+                                float * C) {
+    const int   n_groups = K / TL3_G;
+    const float dequant  = (lut_scale == 0.0f) ? 0.0f : (w_scale / lut_scale);
+
+    int m = 0;
+    while (m < M) {
+        size_t vl = __riscv_vsetvl_e32m4(M - m);
+
+        vint32m4_t acc = __riscv_vmv_v_x_i32m4(0, vl);
+
+        for (int g = 0; g < n_groups; ++g) {
+            const int16_t * lut_g = LUT + g * TL3_LUT_SIZE;
+            vuint8m1_t  idx8  = __riscv_vle8_v_u8m1(A + (size_t)g * M + m, vl);
+            // byte_offset = idx * sizeof(int16_t); widening unsigned u8 -> u16
+            vuint16m2_t off   = __riscv_vwmulu_vx_u16m2(idx8, (uint8_t)sizeof(int16_t), vl);
+            vint16m2_t  parts = __riscv_vluxei16_v_i16m2(lut_g, off, vl);
+            vint32m4_t  wide  = __riscv_vsext_vf2_i32m4(parts, vl);
+            acc = __riscv_vadd_vv_i32m4(acc, wide, vl);
+        }
+
+        vfloat32m4_t accf = __riscv_vfcvt_f_x_v_f32m4(acc, vl);
+        accf = __riscv_vfmul_vf_f32m4(accf, dequant, vl);
+        __riscv_vse32_v_f32m4(C + m, accf, vl);
+
+        m += (int) vl;
+    }
+    return 0;
+}
+
+// ---- preprocessor: quantize activation + build LUT -------------------------
+template<int K>
+static inline void preprocessor_k(void * B, void * LUT_Scales, void * QLUT) {
+    partial_max_reset(LUT_Scales);
+    per_tensor_quant(K, LUT_Scales, B);
+    lut_ctor<K>((int8_t *) QLUT, (bitnet_float_type *) B,
+                (bitnet_float_type *) LUT_Scales);
+}
+
+// ---- top-level dispatch (size-agnostic; no codegen per shape) --------------
+inline void ggml_preprocessor_impl(int /*m*/, int k, void * B,
+                                   void * LUT_Scales, void * QLUT) {
+    partial_max_reset(LUT_Scales);
+    per_tensor_quant(k, LUT_Scales, B);
+
+    const float scale = *((bitnet_float_type *) LUT_Scales);
+    int16_t * lut = (int16_t *) QLUT;
+    const float * b = (const float *) B;
+    const int n_groups = k / TL3_G;
+
+    for (int g = 0; g < n_groups; ++g) {
+        int q[TL3_G];
+        for (int j = 0; j < TL3_G; ++j) {
+            float v = b[g * TL3_G + j] * scale;
+            int qi = (int) lrintf(v);
+            if (qi >  127) qi =  127;
+            if (qi < -127) qi = -127;
+            q[j] = qi;
+        }
+        int16_t * slot = lut + g * TL3_LUT_SIZE;
+        for (int idx = 0; idx < TL3_LUT_SIZE; ++idx) {
+            int r = idx;
+            int w0 = r / 27 - 1; r %= 27;
+            int w1 = r / 9  - 1; r %= 9;
+            int w2 = r / 3  - 1; r %= 3;
+            int w3 = r      - 1;
+            slot[idx] = (int16_t)(w0 * q[0] + w1 * q[1] + w2 * q[2] + w3 * q[3]);
+        }
+    }
+}
+
+inline void ggml_qgemm_lut_impl(int m, int k, void * A, void * LUT,
+                                void * Scales, void * LUT_Scales, void * C) {
+    const float w_scale   = *((bitnet_float_type *) Scales);
+    const float lut_scale = *((bitnet_float_type *) LUT_Scales);
+    qgemm_lut_tl3(m, k,
+                  (const uint8_t *) A,
+                  (const int16_t *) LUT,
+                  w_scale, lut_scale,
+                  (float *) C);
+}
+
+// ---- weight transform: I2_S disk -> TL3 column-major indices ---------------
+// Disk layout (I2_S): for a row of length K, K is split into blocks of 128
+// values. Each 128-value block is stored as 32 packed bytes, where value i
+// in the block comes from byte[i%32] shifted by (6 - 2*(i/32)) bits, using
+// mapping {raw 0,1,2} -> ternary {-1,0,+1}. There is a single fp32 scale at
+// offset K*M/4 at the end of the tensor data.
+inline void ggml_bitnet_transform_tensor_impl(struct ggml_tensor * tensor) {
+    if (!is_type_supported(tensor->type) ||
+        tensor->backend != GGML_BACKEND_TYPE_CPU ||
+        tensor->extra != nullptr) {
+        return;
+    }
+    const int K = (int) tensor->ne[0];
+    const int M = (int) tensor->ne[1];
+    if (K <= 0 || M <= 0 || (K % TL3_QK_I2_S) != 0 || (K % TL3_G) != 0) {
+        return;
+    }
+
+    const int n_groups    = K / TL3_G;
+    const int row_bytes   = K / 4;
+    const int blocks_per_row = K / TL3_QK_I2_S;
+
+    uint8_t * qw = (uint8_t *) aligned_malloc((size_t) n_groups * (size_t) M);
+    bitnet_float_type * scales =
+        (bitnet_float_type *) aligned_malloc(sizeof(bitnet_float_type));
+    if (qw == nullptr || scales == nullptr) {
+        aligned_free(qw);
+        aligned_free(scales);
+        return;
+    }
+
+    const uint8_t * disk = (const uint8_t *) tensor->data;
+    int8_t * row_tern = (int8_t *) malloc((size_t) K);
+    if (row_tern == nullptr) {
+        aligned_free(qw);
+        aligned_free(scales);
+        return;
+    }
+
+    for (int mrow = 0; mrow < M; ++mrow) {
+        const uint8_t * rowp = disk + (size_t) mrow * row_bytes;
+        for (int blk = 0; blk < blocks_per_row; ++blk) {
+            const uint8_t * bp = rowp + (size_t) blk * TL3_QK_I2_S_PACKED_BYTES;
+            for (int i = 0; i < TL3_QK_I2_S; ++i) {
+                const int byte_idx = i % TL3_QK_I2_S_PACKED_BYTES;
+                const int shift    = 6 - 2 * (i / TL3_QK_I2_S_PACKED_BYTES);
+                const int raw      = (bp[byte_idx] >> shift) & 0x03;
+                // {0,1,2} -> {-1,0,+1}
+                row_tern[blk * TL3_QK_I2_S + i] = (int8_t)(raw - 1);
+            }
+        }
+        for (int g = 0; g < n_groups; ++g) {
+            int w0 = row_tern[g * TL3_G + 0];
+            int w1 = row_tern[g * TL3_G + 1];
+            int w2 = row_tern[g * TL3_G + 2];
+            int w3 = row_tern[g * TL3_G + 3];
+            uint8_t idx = (uint8_t)(((w0 + 1) * 27) +
+                                    ((w1 + 1) *  9) +
+                                    ((w2 + 1) *  3) +
+                                    ((w3 + 1)));
+            qw[(size_t) g * M + mrow] = idx;
+        }
+    }
+    free(row_tern);
+
+    const float * disk_scale = (const float *) (disk + (size_t) M * row_bytes);
+    scales[0] = (bitnet_float_type) disk_scale[0];
+
+    tensor->extra = bitnet_tensor_extras + bitnet_tensor_extras_index;
+    bitnet_tensor_extras[bitnet_tensor_extras_index++] = {
+        /* .lut_scales_size = */ 1,
+        /* .BK              = */ K,
+        /* .n_tile_num      = */ 1,
+        /* .qweights        = */ qw,
+        /* .scales          = */ scales
+    };
+}
+
+#endif // GGML_BITNET_RISCV_TL3

@@ -1,4 +1,17 @@
 # Extensions
+build/
+build-*/
+models/
+*.gguf
+*.bin
+*.log
+*.out
+gmon.out
+qemu.log
+*.o
+*.so
+.cache/
+__pycache__/
 
 *.a
 *.bat
