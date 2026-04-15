@@ -262,8 +262,8 @@ def compile():
         cmd += [
             f"-DBITNET_RISCV_TL3={'ON' if args.quant_type == 'tl3' else 'OFF'}",
             f"-DCMAKE_TOOLCHAIN_FILE={args.toolchain_file}",
-            f"-DCMAKE_C_FLAGS=-D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -funroll-loops -g0 -D_FORTIFY_SOURCE=1 -march={args.march} -mrvv-vector-bits=zvl",
-            f"-DCMAKE_CXX_FLAGS=-D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -funroll-loops -g0 -D_FORTIFY_SOURCE=1 -march={args.march} -mrvv-vector-bits=zvl",
+            f"-DCMAKE_C_FLAGS=-D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 -O2 -g0 -D_FORTIFY_SOURCE=1 -march={args.march}",
+            f"-DCMAKE_CXX_FLAGS=-D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 -O2 -g0 -D_FORTIFY_SOURCE=1 -march={args.march}",
             '-DBUILD_SHARED_LIBS=OFF',
         ]
     else:
@@ -295,8 +295,8 @@ def parse_args():
     parser.add_argument("--toolchain-file", type=str,
                         default=os.path.expanduser('~/riscv-gnu-toolchain-cx1c/share/toolchain/toolchainfile.cmake'),
                         help="CMake toolchain file used for riscv64 builds")
-    parser.add_argument("--march", type=str, default="rv64gcv_zvl256b",
-                        help="Target -march value used for riscv64 builds (default tuned for K1 VLEN=256)")
+    parser.add_argument("--march", type=str, default="rv64gcv",
+                        help="Target -march value used for riscv64 builds")
     parser.add_argument("--quant-type", "-q", type=str, help="Quantization type",
                         choices=sorted(set(q for quant_list in SUPPORTED_QUANT_TYPES.values() for q in quant_list)),
                         default="i2_s")
