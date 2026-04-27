@@ -259,24 +259,65 @@ def compile():
     ]
 
     if target_arch == "riscv64":
+        if args.mcpu:
+            riscv_arch_flags = [
+                f"-mcpu={args.mcpu}",
+                "-fno-tree-vectorize",
+                "-fno-tree-slp-vectorize",
+            ]
+        else:
+            riscv_arch_flags = [f"-march={args.march}"]
+
+        common_flags = [
+            "-D_LARGEFILE_SOURCE",
+            "-D_LARGEFILE64_SOURCE",
+            "-D_FILE_OFFSET_BITS=64",
+            "-O2",
+            "-D_FORTIFY_SOURCE=1",
+            *riscv_arch_flags,
+        ]
+
+        if args.enable_gprof:
+            common_flags += ["-g", "-pg"]
+            exe_linker_flags = "-pg"
+        else:
+            common_flags += ["-g0"]
+            exe_linker_flags = ""
+
         cmd += [
             f"-DBITNET_RISCV_TL3={'ON' if args.quant_type == 'tl3' else 'OFF'}",
             f"-DCMAKE_TOOLCHAIN_FILE={args.toolchain_file}",
-            f"-DCMAKE_C_FLAGS=-D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 -O2 -g0 -D_FORTIFY_SOURCE=1 -march={args.march}",
-            f"-DCMAKE_CXX_FLAGS=-D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 -O2 -g0 -D_FORTIFY_SOURCE=1 -march={args.march}",
-            '-DBUILD_SHARED_LIBS=OFF',
+            f"-DCMAKE_C_FLAGS={' '.join(common_flags)}",
+            f"-DCMAKE_CXX_FLAGS={' '.join(common_flags)}",
+            f"-DCMAKE_EXE_LINKER_FLAGS={exe_linker_flags}",
+            "-DBUILD_SHARED_LIBS=OFF",
         ]
+
+        if args.mcpu:
+            cmd.append(f"-DGGML_RISCV_MCPU={args.mcpu}")
+        else:
+            cmd.append(f"-DGGML_RISCV_MARCH={args.march}")
+
+        if getattr(args, 'm1_only', False):
+            cmd.append("-DBITNET_RISCV_M1_ONLY=ON")
     else:
+        clang_flags = []
+        if args.enable_gprof:
+            clang_flags = ["-DCMAKE_C_FLAGS=-O2 -g -pg",
+                           "-DCMAKE_CXX_FLAGS=-O2 -g -pg",
+                           "-DCMAKE_EXE_LINKER_FLAGS=-pg"]
+
         cmd += [
             "-DCMAKE_C_COMPILER=clang",
             "-DCMAKE_CXX_COMPILER=clang++",
+            *clang_flags,
         ]
 
     print("cmake cmd:", " ".join(cmd))
 
     run_command(cmd, log_step="generate_build_files")
     run_command(["cmake", "--build", "build", "--config", "Release"], log_step="compile")
-
+    
 def main():
     setup_gguf()
     gen_code()
@@ -296,12 +337,18 @@ def parse_args():
                         default=os.path.expanduser('~/riscv-gnu-toolchain-cx1c/share/toolchain/toolchainfile.cmake'),
                         help="CMake toolchain file used for riscv64 builds")
     parser.add_argument("--march", type=str, default="rv64gcv",
-                        help="Target -march value used for riscv64 builds")
+                        help="Target -march value used for riscv64 builds (ignored if --mcpu is set)")
+    parser.add_argument("--mcpu", type=str, default=None,
+                        help="Target -mcpu value (e.g. chuxin-1c). Overrides --march when set")
+    parser.add_argument("--m1-only", action="store_true",
+                        help="Restrict RVV to LMUL=m1 (required for chuxin-1c)")
     parser.add_argument("--quant-type", "-q", type=str, help="Quantization type",
                         choices=sorted(set(q for quant_list in SUPPORTED_QUANT_TYPES.values() for q in quant_list)),
                         default="i2_s")
     parser.add_argument("--quant-embd", action="store_true", help="Quantize the embeddings to f16")
     parser.add_argument("--use-pretuned", "-p", action="store_true", help="Use the pretuned kernel parameters")
+    parser.add_argument("--enable-gprof", action="store_true",
+                    help="Build with -pg for gprof profiling")
     parsed_args = parser.parse_args()
 
     if parsed_args.quant_type not in SUPPORTED_QUANT_TYPES[parsed_args.target_arch]:

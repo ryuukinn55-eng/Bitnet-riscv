@@ -91,26 +91,64 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
 }
 
 #if defined(__riscv_v_intrinsic) || defined(__riscv_vector)
-// RVV path. Two tuned variants, selected at runtime by VLEN:
+
+#ifdef GGML_RISCV_M1_ONLY
+// ── cx1c path: xvector extension, LMUL=m1 only, no widening. ──────
+// VLEN=1024, e16m1 = 64 elements. Process q and y in i16 to avoid
+// i8 overflow (q*y ∈ [-384,381]).
 //
-//   * e8m1 path — VLEN>=256 (SpaceMit K1 X60, Sophgo SG2380, ...):
-//     a 32-byte block fits exactly in one LMUL=1 group, so the vector unit
-//     is fully utilized while using only half the registers of LMUL=2.
-//     This is the fast path on BPI-F3.
-//
-//   * e8m2 path — VLEN=128 (T-Head C908, ...): a 32-byte block spans two
-//     physical vector registers; LMUL=2 gives a single logical group.
-//
-// Both variants use 4 independent i16 accumulators (one per 2-bit quadrant)
-// to break the vwmacc RAW chain — X60's vwmacc has ~4-6 cycle latency and
-// pipelined 1/cycle throughput, so 4-way ILP is required to saturate.
-//
-// Per-lane i16 bound: |q * y| <= 2*127 = 254, so each accumulator stays
-// below 254*CHUNK. CHUNK=64 gives 16256 < 32767 with comfortable margin.
+// Scalar unpack i8→i16, then vector vmacc + vredsum.
+// Per-lane bound: |q*y| ≤ 384. Over CHUNK blocks × 4 quadrants:
+// max |acc| = CHUNK * 4 * 384 = 30720 < 32767 when CHUNK=20.
+#define CX1C_CHUNK 20
+
+static inline int ggml_vec_dot_i2_i8_s_rvv(int nb, const uint8_t * x, const int8_t * y) {
+    const size_t vl = __riscv_vsetvl_e16m1(QK_I2_S_PACKED_BYTES);
+
+    int32_t grand_sum = 0;
+    int block = 0;
+
+    while (block < nb) {
+        int chunk = nb - block;
+        if (chunk > CX1C_CHUNK) chunk = CX1C_CHUNK;
+
+        vint16m1_t acc = __riscv_vmv_v_x_i16m1(0, vl);
+
+        for (int j = 0; j < chunk; j++) {
+            const uint8_t * xb = x + (block + j) * QK_I2_S_PACKED_BYTES;
+            const int8_t  * yb = y + (block + j) * QK_I2_S;
+
+            int16_t q16[QK_I2_S_PACKED_BYTES];
+            int16_t y16[QK_I2_S_PACKED_BYTES];
+
+            for (int g = 0; g < 4; g++) {
+                const int shift = 6 - 2 * g;
+                for (int i = 0; i < QK_I2_S_PACKED_BYTES; i++) {
+                    q16[i] = (int16_t)((xb[i] >> shift) & 0x03);
+                    y16[i] = (int16_t)(yb[g * QK_I2_S_GROUP_SIZE + i]);
+                }
+
+                vint16m1_t vq = __riscv_vle16_v_i16m1(q16, vl);
+                vint16m1_t vy = __riscv_vle16_v_i16m1(y16, vl);
+                acc = __riscv_vmacc_vv_i16m1(acc, vq, vy, vl);
+            }
+        }
+
+        vint16m1_t vzero = __riscv_vmv_v_x_i16m1(0, 1);
+        vint16m1_t vsum = __riscv_vredsum_vs_i16m1_i16m1(acc, vzero, vl);
+        grand_sum += (int32_t)__riscv_vmv_x_s_i16m1_i16(vsum);
+
+        block += chunk;
+    }
+
+    return grand_sum;
+}
+
+#else // !GGML_RISCV_M1_ONLY
+// ── Standard RVV path (LMUL=m1/m2/m4/m8 available) ────────────────
 #define BITNET_RVV_CHUNK 64
 
 static inline int ggml_vec_dot_i2_i8_s_rvv_m1(int nb, const uint8_t * x, const int8_t * y) {
-    // Caller guarantees VLMAX(e8m1) >= 32.
     const size_t vl = __riscv_vsetvl_e8m1(QK_I2_S_PACKED_BYTES);
 
     vint32m4_t accu32 = __riscv_vmv_v_x_i32m4(0, vl);
@@ -129,8 +167,6 @@ static inline int ggml_vec_dot_i2_i8_s_rvv_m1(int nb, const uint8_t * x, const i
             const uint8_t * xb = x + (block + j) * QK_I2_S_PACKED_BYTES;
             const int8_t  * yb = y + (block + j) * QK_I2_S;
 
-            // K1 has a hardware stride prefetcher; a single hint 2 blocks
-            // ahead is enough to keep L1 warm on the 128B/block y stream.
             if (j + 2 < chunk) {
                 __builtin_prefetch(yb + 2 * QK_I2_S,      0, 0);
                 __builtin_prefetch(yb + 2 * QK_I2_S + 64, 0, 0);
@@ -138,7 +174,6 @@ static inline int ggml_vec_dot_i2_i8_s_rvv_m1(int nb, const uint8_t * x, const i
 
             const vuint8m1_t packed = __riscv_vle8_v_u8m1(xb, vl);
 
-            // q0 = packed >> 6  (top 2 bits, no mask needed)
             const vint8m1_t q0 = __riscv_vreinterpret_v_u8m1_i8m1(
                 __riscv_vsrl_vx_u8m1(packed, 6, vl));
             const vint8m1_t q1 = __riscv_vreinterpret_v_u8m1_i8m1(
@@ -153,7 +188,6 @@ static inline int ggml_vec_dot_i2_i8_s_rvv_m1(int nb, const uint8_t * x, const i
             const vint8m1_t y2 = __riscv_vle8_v_i8m1(yb + 2 * QK_I2_S_GROUP_SIZE, vl);
             const vint8m1_t y3 = __riscv_vle8_v_i8m1(yb + 3 * QK_I2_S_GROUP_SIZE, vl);
 
-            // Four parallel MAC chains — breaks X60's vwmacc RAW stall.
             acc_a = __riscv_vwmacc_vv_i16m2(acc_a, q0, y0, vl);
             acc_b = __riscv_vwmacc_vv_i16m2(acc_b, q1, y1, vl);
             acc_c = __riscv_vwmacc_vv_i16m2(acc_c, q2, y2, vl);
@@ -174,7 +208,6 @@ static inline int ggml_vec_dot_i2_i8_s_rvv_m1(int nb, const uint8_t * x, const i
 }
 
 static inline int ggml_vec_dot_i2_i8_s_rvv_m2(int nb, const uint8_t * x, const int8_t * y) {
-    // Caller guarantees VLMAX(e8m2) >= 32 (i.e. VLEN >= 128).
     const size_t vl = __riscv_vsetvl_e8m2(QK_I2_S_PACKED_BYTES);
 
     vint32m8_t accu32 = __riscv_vmv_v_x_i32m8(0, vl);
@@ -234,15 +267,12 @@ static inline int ggml_vec_dot_i2_i8_s_rvv_m2(int nb, const uint8_t * x, const i
 }
 
 static inline int ggml_vec_dot_i2_i8_s_rvv(int nb, const uint8_t * x, const int8_t * y) {
-    // Prefer e8m1: saturates VLEN>=256 and uses fewer registers.
     if (__riscv_vsetvl_e8m1(QK_I2_S_PACKED_BYTES) == (size_t)QK_I2_S_PACKED_BYTES) {
         return ggml_vec_dot_i2_i8_s_rvv_m1(nb, x, y);
     }
-    // VLEN=128 path.
     if (__riscv_vsetvl_e8m2(QK_I2_S_PACKED_BYTES) == (size_t)QK_I2_S_PACKED_BYTES) {
         return ggml_vec_dot_i2_i8_s_rvv_m2(nb, x, y);
     }
-    // VLEN too small for a 32-byte block in one group; scalar fallback.
     int total = 0;
     for (int b = 0; b < nb; ++b) {
         total += ggml_i2_s_block_dot_scalar(
@@ -250,7 +280,8 @@ static inline int ggml_vec_dot_i2_i8_s_rvv(int nb, const uint8_t * x, const int8
     }
     return total;
 }
-#endif
+#endif // GGML_RISCV_M1_ONLY
+#endif // __riscv_v_intrinsic || __riscv_vector
 
 // Dot product of I2 (2-bit) * I8 (8-bit)
 void ggml_vec_dot_i2_i8_s(
